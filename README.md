@@ -1,68 +1,59 @@
-# monod-pinn
+# genmonod
 
-A physics-informed convolutional neural network (PI-CNN) that estimates the
-parameters of a Monod growth-kinetics model directly from time-series
-measurements of microbial strain populations (and, optionally, substrate
-concentration).
-
-This repository is a **starting template**, not a finished research product.
-It is organized like a real installable Python package so you can push it to
-GitHub, `pip install` it (locally or eventually from GitHub), and build on it.
-Every file below has a comment block at the top explaining what it does and
-whether you need to edit it.
+A generalized, multi-strain Monod kinetics fitter with a visual matrix
+editor and a fit-history-based initial-guess model. This is a from-
+scratch Python redesign of an earlier MATLAB fitting tool, built to (a)
+fix bugs in that tool, and (b) generalize it — arbitrary strain counts,
+optional mutation/translocation between any strains, optional toxins,
+and any parameter fixed or free, all configured visually rather than by
+editing code.
 
 ---
 
-## 1. The science (what the model is doing)
+## 1. The model
 
-The classic Monod model describes microbial growth limited by a single
-substrate:
+Every process is a SEPARATE additive term in the population equation —
+this is what "generalized" means here: switching a process off just
+removes its term, it doesn't change the equations for anything else.
 
 ```
-dX/dt = mu_max * S/(Ks + S) * X          (biomass / population growth)
-dS/dt = -(1/Y) * mu_max * S/(Ks + S) * X  (substrate consumption)
+dN_i/dt = N_i * [ growth_i(metabolites) - toxin_kill_i(toxins) - mortality_i ]
+          + mutation_i(other strains)         [optional]
+          + translocation_i(other strains)    [optional]
+
+dC_k/dt = supply_k - dilution_k * C_k - consumption by strains
+dTox_l/dt = supply_l - decay_l * Tox_l + secretion by strains
 ```
 
-Where:
-- `X(t)` = population / biomass at time t
-- `S(t)` = substrate concentration at time t
-- `mu_max` = maximum specific growth rate
-- `Ks`   = half-saturation constant (substrate level at which growth rate is half of mu_max)
-- `Y`    = yield coefficient (biomass produced per unit substrate consumed)
+- **growth**: saturable (Monod) response to each metabolite, own rate + half-saturation per (strain, metabolite) pair.
+- **toxin_kill**: saturable response to each toxin, same structure as growth but subtractive.
+- **mutation**: a strain spontaneously converts into another at a per-capita rate — doesn't require contact between strains.
+- **translocation**: a strain converts another strain on CONTACT (mass-action, like conjugation/plasmid transfer) — does require both strains present.
 
-Normally you'd estimate `(mu_max, Ks, Y)` by nonlinear least-squares curve
-fitting against a single dataset. Here, instead, a 1D CNN is trained to look
-at a whole time-series curve and directly output the three parameters. It is
-made **physics-informed** by adding a loss term that re-simulates the Monod
-ODEs using the CNN's predicted parameters and penalizes the network when the
-simulated trajectory doesn't match the observed data. This lets you (a) train
-on many synthetic curves quickly, and (b) fine-tune / regularize using real
-data even when you don't know the "true" parameters for that real curve.
+Every rate above lives in its own matrix (e.g. `growth_rate` is strains × metabolites), and every entry in every matrix is independently either FIXED (you know its value) or FREE (the fitter estimates it) — set visually in the app.
 
 ## 2. Project layout
 
 ```
-monod-pinn/
-├── src/monod_pinn/
-│   ├── __init__.py       # package version + convenience imports
-│   ├── physics.py        # Monod ODE definitions + differentiable RK4 integrator
-│   ├── models.py         # the 1D CNN architecture
-│   ├── losses.py         # data loss + physics-residual loss
-│   ├── dataset.py        # PyTorch Dataset + synthetic data generator
-│   ├── train.py          # training loop
-│   ├── evaluate.py       # plotting / evaluation helpers
-│   └── utils.py          # seeding, normalization, checkpoint helpers
-├── scripts/
-│   ├── generate_synthetic_data.py   # CLI: make a synthetic training set
-│   └── run_training.py              # CLI: train a model end-to-end
+genmonod/
+├── src/genmonod/
+│   ├── config.py           # SystemConfig + MatrixSpec: the "constraints" object
+│   ├── physics.py          # the generalized ODE system
+│   ├── data_io.py          # CSV loading with explicit column mapping
+│   ├── fitting.py          # pack/unpack free params, scipy least_squares wrapper
+│   ├── fit_store.py        # persists past fits to a local file
+│   ├── amortized_model.py  # small MLP trained on stored fits -> better initial guesses
+│   ├── plotting.py         # observed-vs-fit plots
+│   ├── app.py              # the visual Streamlit app (the main entry point)
+│   └── cli.py               # `genmonod-app` console command
 ├── examples/
-│   └── quickstart_example.py        # minimal runnable example
+│   └── quickstart_example.py   # scripted (non-visual) end-to-end example
 ├── tests/
 │   ├── test_physics.py
-│   └── test_models.py
+│   └── test_fitting.py
 ├── data/
-│   └── README.md         # describes the CSV format expected for real data
-├── pyproject.toml        # package metadata + dependencies
+│   └── README.md           # CSV format notes
+├── pyproject.toml
 ├── requirements.txt
 ├── LICENSE
 └── .gitignore
@@ -71,56 +62,54 @@ monod-pinn/
 ## 3. Installation
 
 ```bash
-git clone https://github.com/<your-username>/monod-pinn.git
-cd monod-pinn
+git clone https://github.com/<your-username>/genmonod.git
+cd genmonod
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-The `-e` (editable) install means changes you make to files under `src/` are
-picked up immediately without reinstalling — this is the standard way to
-develop a Python package locally.
-
-## 4. Quickstart
-
-Generate a synthetic dataset, then train:
+## 4. Running the visual app
 
 ```bash
-python scripts/generate_synthetic_data.py --n_curves 2000 --out data/synthetic.npz
-python scripts/run_training.py --data data/synthetic.npz --epochs 100 --out checkpoints/
+genmonod-app
 ```
 
-Or run the minimal end-to-end example:
+This opens the tool in your browser. From there:
+1. Set strain/metabolite/toxin counts and toggle mutation/translocation in the sidebar.
+2. Edit each parameter matrix — blank = fit it, a number = fix it.
+3. Upload one or more CSVs (multiple files are fit **jointly** — one shared parameter set explaining all of them, e.g. several replicate tubes) and map their columns to your strains/metabolites/toxins.
+4. Click **Run fit**. Results (fitted matrices + plot) appear below.
+5. Each fit is optionally saved so future fits of the *same system shape* (same strain/metabolite/toxin counts and mutation/translocation settings) get a better starting guess automatically — the more you use it, the better the initial guesses get.
+
+## 5. Scripting instead of using the app
 
 ```bash
 python examples/quickstart_example.py
 ```
 
-## 5. Using your own real data
+See that file for the pattern: `default_config(...)` → optionally `spec.set_fixed(value, i, j)` on anything you know → `Dataset(...)` → `fit(cfg, dataset)`.
 
-Put a CSV per experiment (or one long-format CSV) in `data/` following the
-format described in `data/README.md`, then point `dataset.py`'s
-`RealCurveDataset` at it. See the comments in `dataset.py` for exactly what
-columns are expected.
+## 6. A real modeling gotcha worth knowing up front
 
-## 6. What you still need to do
+If you leave BOTH directions of a mutation or translocation pair free
+(e.g. `mutation[0,1]` and `mutation[1,0]` both unfixed), the fit can
+converge perfectly on the data while landing on individual rates that
+don't match reality — only their *net difference* is actually
+identifiable from population-count data. If you know a transfer only
+goes one way, fix the reverse entry to `0` (see
+`examples/quickstart_example.py`). If you need both directions
+separately, you'll need data that distinguishes the strains after
+transfer (e.g. a third "transconjugant" population, the way the
+original MATLAB tool modeled donor/recipient/transconjugant as three
+separate observed states rather than a two-strain conversion).
 
-This template runs out of the box on **synthetic** data. To make it useful
-for your actual research you will likely need to:
+## 7. What you still need to do
 
-1. Confirm the Monod variant in `physics.py` matches your system (e.g. add
-   a death-rate term, multiple substrates, or a lag phase, if relevant).
-2. Replace/extend `dataset.py`'s `RealCurveDataset` to parse your actual
-   file format.
-3. Tune the CNN architecture in `models.py` (kernel sizes, depth) once you
-   know the typical length/noise level of your real time series.
-4. Adjust the loss weighting in `losses.py` (`physics_weight`) — this is the
-   most important hyperparameter in any physics-informed network.
+1. If your real system needs a physical process beyond growth/toxin/mortality/mutation/translocation, add it as its own block in `physics.py` (each existing process is clearly separated so you can copy the pattern) and register its matrix in `fitting.py`'s `_MATRIX_ATTRS` list.
+2. The amortized guesser (`amortized_model.py`) only kicks in once you have several stored fits of the same system shape — until then, fits just start from the bounds midpoint, which is normal.
+3. Bounds for each parameter default to generic ranges in `config.py`'s `default_config` — tighten these once you have a sense of realistic values for your organism.
 
-Every file has a `# NEEDS YOUR INPUT` comment marking the specific lines
-most likely to require changes for your data.
-
-## 7. License
+## 8. License
 
 MIT — see `LICENSE`.

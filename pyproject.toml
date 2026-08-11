@@ -1,18 +1,14 @@
-# NEEDS YOUR INPUT: change "name", "authors", and the GitHub URL under
+# NEEDS YOUR INPUT: change "authors" and the GitHub URL under
 # [project.urls] before you publish. Everything else can stay as-is.
-#
-# This file is what makes the project "pip installable" — it tells Python
-# packaging tools your package's name, dependencies, and where the source
-# code lives (the src/ layout below).
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=65.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "monod-pinn"
+name = "genmonod"
 version = "0.1.0"
-description = "Physics-informed CNN for fitting Monod growth-kinetics parameters from strain population time series"
+description = "Generalized multi-strain Monod kinetics fitter with a visual matrix editor and a fit-history-based initial-guess model"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -20,12 +16,12 @@ authors = [
     { name = "Your Name", email = "you@example.com" }
 ]
 dependencies = [
-    "torch>=2.0",
     "numpy>=1.23",
     "scipy>=1.9",
     "pandas>=1.5",
     "matplotlib>=3.6",
-    "tqdm>=4.64",
+    "streamlit>=1.30",
+    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -33,9 +29,13 @@ dev = [
     "pytest>=7.0",
 ]
 
-[project.urls]
-Repository = "https://github.com/<your-username>/monod-pinn"
+[project.scripts]
+# NEEDS YOUR INPUT: nothing. This is what makes `genmonod-app` work as a
+# command after `pip install -e .` — it points to cli.py's main().
+genmonod-app = "genmonod.cli:main"
 
-# This tells setuptools the actual package code is under src/monod_pinn
+[project.urls]
+Repository = "https://github.com/<your-username>/genmonod"
+
 [tool.setuptools.packages.find]
 where = ["src"]
