@@ -39,13 +39,35 @@ class Dataset:
        Use np.nan for any (state, timepoint) you don't have a measurement
        for — those are simply skipped in the fit residual.
     y0: (S+M+T,) initial condition. Defaults to Y[0] if not given
-        explicitly (useful when t=0 wasn't actually measured).
+        explicitly (useful when t=0 wasn't actually measured). For any
+        entry where the true initial value is unknown, this is just a
+        placeholder — see y0_free_mask.
+    y0_free_mask: (S+M+T,) bool array. Where True, that entry of y0 is
+        UNKNOWN and will be fit as a free parameter (bounded, see
+        fitting.py's Y0_BOUNDS) rather than trusted as given. Defaults
+        to wherever the original data had no measurement at t=0 — this
+        is what makes it possible to fit growth on an unmeasured/hidden
+        metabolite or toxin pool, instead of being stuck with it fixed
+        at an arbitrary placeholder value.
     name: a label for this dataset, e.g. "Tube Run 1".
+
+    # WHAT WAS FIXED: earlier versions of this package fixed any
+    # unmeasured initial condition at a small constant (1e-3) — fine for
+    # a measured state (real y0 from data) but silently wrong for a
+    # truly unknown one (e.g. an unmeasured metabolite/toxin pool you
+    # need to have a growth mechanism at all): a wrong fixed guess can't
+    # be corrected by the fit no matter how good the rest of the model
+    # is. Now those entries are fit, not assumed.
     """
     t: np.ndarray
     Y: np.ndarray
     y0: np.ndarray
+    y0_free_mask: np.ndarray = None
     name: str = "dataset"
+
+    def __post_init__(self):
+        if self.y0_free_mask is None:
+            self.y0_free_mask = np.zeros_like(self.y0, dtype=bool)
 
     @classmethod
     def from_csv(
@@ -63,7 +85,9 @@ class Dataset:
                 {"Strain_1": "OD_recipient", "Strain_2": "OD_donor",
                  "Metabolite_1": "Glucose_mM"}
                 Any cfg state name NOT present in column_map is treated
-                as entirely unmeasured (filled with NaN in Y).
+                as entirely unmeasured (filled with NaN in Y), and its
+                initial condition will be FIT rather than assumed (see
+                Dataset.y0_free_mask above).
             cfg: the SystemConfig this dataset will be fit against —
                  used only to get the expected state ordering/names.
         """
@@ -77,9 +101,11 @@ class Dataset:
             if csv_col is not None and csv_col in df.columns:
                 Y[:, j] = df[csv_col].to_numpy(dtype=float)
 
+        y0_free_mask = np.isnan(Y[0])
         y0 = Y[0].copy()
-        # if any initial values are missing, fall back to a small positive
-        # placeholder rather than NaN (the ODE solver needs a real y0)
-        y0 = np.where(np.isnan(y0), 1e-3, y0)
+        # placeholder only for display/standalone-simulate purposes —
+        # fitting.py overrides any y0_free_mask=True entry with a fitted
+        # value instead of trusting this
+        y0 = np.where(y0_free_mask, 1.0, y0)
 
-        return cls(t=t, Y=Y, y0=y0, name=name)
+        return cls(t=t, Y=Y, y0=y0, y0_free_mask=y0_free_mask, name=name)

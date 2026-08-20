@@ -23,12 +23,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from genmonod.config import default_config, SystemConfig
+from genmonod.config import default_config, SystemConfig, add_dosing_event, add_passage_event, add_production
 from genmonod.data_io import Dataset
-from genmonod.fitting import fit, pack_free_params
+from genmonod.fitting import fit, pack_free_params, pack_free_params_with_y0
+from genmonod.strain_library import record_strain_params, apply_library, DEFAULT_LIBRARY_PATH
 from genmonod.fit_store import record_fit, DEFAULT_STORE_PATH, _data_summary
 from genmonod.amortized_model import guess_initial_params
 from genmonod.plotting import plot_fit
+from genmonod.model_selection import compare_structures, summarize
 
 st.set_page_config(page_title="genmonod — multi-strain Monod fitter", layout="wide")
 st.title("Generalized Monod System Fitter")
@@ -52,6 +54,7 @@ if "dims_key" not in st.session_state or st.session_state.dims_key != dims_key:
         n_strains, n_metabolites, n_toxins, include_mutation, include_translocation
     )
     st.session_state.dims_key = dims_key
+    st.session_state.schedule_rows = []  # old events may reference now-removed strains/metabolites
 
 cfg: SystemConfig = st.session_state.cfg
 
@@ -62,6 +65,17 @@ with st.sidebar.expander("Rename strains / metabolites / toxins"):
         cfg.metabolite_names[k] = st.text_input(f"Metabolite {k+1} name", value=cfg.metabolite_names[k], key=f"mname_{k}")
     for l in range(n_toxins):
         cfg.toxin_names[l] = st.text_input(f"Toxin {l+1} name", value=cfg.toxin_names[l], key=f"tname_{l}")
+
+# keep cfg.subsets' keys in sync with strain_names -- renaming a strain
+# above does NOT retroactively update subsets' dict keys on its own, so
+# without this a rename would silently orphan any overlap grouping
+# configured under the old name
+_combined = cfg.combined_substrate_names()
+for _s in cfg.strain_names:
+    if _s not in cfg.subsets:
+        cfg.subsets[_s] = [[n] for n in _combined]
+for _stale in [k for k in cfg.subsets if k not in cfg.strain_names]:
+    del cfg.subsets[_stale]
 
 # ---------------------------------------------------------------------------
 # 2. MATRIX EDITORS — leave a cell blank to fit it freely, type a number to
@@ -86,31 +100,81 @@ def _vector_editor(label: str, spec, names: list[str], key: str):
     st.caption(f"{label} — bounds for free entries: [{spec.lower}, {spec.upper}]")
 
 
-tabs = st.tabs(["Growth", "Toxin", "Strain-strain", "Environment"])
+tabs = st.tabs(["Growth / Toxin (r, K, c)", "Subsets (metabolic overlap)", "Production", "Strain-strain", "Environment"])
+
+combined_names = cfg.combined_substrate_names()
 
 with tabs[0]:
-    if n_metabolites > 0:
-        st.subheader("Growth rate (r)")
-        _matrix_editor("growth_rate", cfg.growth_rate, cfg.strain_names, cfg.metabolite_names, "r_edit")
-        st.subheader("Half-saturation (Ks)")
-        _matrix_editor("growth_half_sat", cfg.growth_half_sat, cfg.strain_names, cfg.metabolite_names, "ks_edit")
-        st.subheader("Consumption")
-        _matrix_editor("consumption", cfg.consumption, cfg.strain_names, cfg.metabolite_names, "cons_edit")
+    st.caption(
+        "One combined axis: metabolites, then toxins. A toxin is just a substrate "
+        "with a NEGATIVE r (it subtracts from growth instead of adding to it) — "
+        "same matrices, no separate toxin-specific editor needed."
+    )
+    if combined_names:
+        st.subheader("r — growth rate constant (metabolite: usually >0; toxin: usually <0)")
+        _matrix_editor("r", cfg.r, cfg.strain_names, combined_names, "r_edit")
+        st.subheader("K — Monod constant (shared between growth and consumption/uptake)")
+        _matrix_editor("K", cfg.K, cfg.strain_names, combined_names, "K_edit")
+        st.subheader("c — consumption / uptake rate")
+        _matrix_editor("c", cfg.c, cfg.strain_names, combined_names, "c_edit")
     else:
-        st.info("Add at least one metabolite in the sidebar to configure growth terms.")
+        st.info("Add at least one metabolite or toxin in the sidebar to configure growth/uptake.")
 
 with tabs[1]:
-    if n_toxins > 0:
-        st.subheader("Toxin kill rate (P)")
-        _matrix_editor("toxin_kill_rate", cfg.toxin_kill_rate, cfg.strain_names, cfg.toxin_names, "p_edit")
-        st.subheader("Toxin half-saturation (K)")
-        _matrix_editor("toxin_half_sat", cfg.toxin_half_sat, cfg.strain_names, cfg.toxin_names, "k_tox_edit")
-        st.subheader("Secretion")
-        _matrix_editor("secretion", cfg.secretion, cfg.strain_names, cfg.toxin_names, "secr_edit")
+    st.caption(
+        "Which substrates SHARE a saturation denominator (compete for uptake capacity) "
+        "for a given strain — this is precisely what 'metabolic overlap' means here. "
+        "Two substrates in the same group compete; substrates not grouped with anything "
+        "saturate independently. Group a toxin with a metabolite to represent 'toxin "
+        "competes with metabolites for uptake' instead of having an independent supply."
+    )
+    if len(combined_names) >= 2:
+        sel_strain = st.selectbox("Strain", cfg.strain_names, key="subset_strain")
+        current_groups = cfg.subsets.get(sel_strain, [[n] for n in combined_names])
+        st.caption(f"Current groups for {sel_strain}: " + " | ".join("+".join(g) for g in current_groups))
+        group_pick = st.multiselect(
+            "Select substrates to group together (competing for shared uptake)",
+            combined_names, key="subset_pick",
+        )
+        if st.button("Set this group") and len(group_pick) >= 2:
+            others = [n for n in combined_names if n not in group_pick]
+            cfg.subsets[sel_strain] = [group_pick] + [[n] for n in others]
+            st.rerun()
+        if st.button("Reset to independent (no overlap) for this strain"):
+            cfg.subsets[sel_strain] = [[n] for n in combined_names]
+            st.rerun()
     else:
-        st.info("Add at least one toxin in the sidebar to configure toxin terms.")
+        st.info("Need at least 2 metabolites/toxins combined to configure overlap.")
 
 with tabs[2]:
+    st.caption(
+        "A strain SYNTHESIZING one substrate from another (the paper's 'ς' term) — "
+        "different from growth/consumption: this saturates on the PRECURSOR's own "
+        "concentration via its own Monod constant."
+    )
+    if "production_rows" not in st.session_state:
+        st.session_state.production_rows = []
+    if combined_names:
+        pc = st.columns(3)
+        p_product = pc[0].selectbox("Product", combined_names, key="prod_product")
+        p_strain = pc[1].selectbox("Producing strain", cfg.strain_names, key="prod_strain")
+        p_precursor = pc[2].selectbox("Precursor", combined_names, key="prod_precursor")
+        if st.button("Add production pathway"):
+            st.session_state.production_rows.append({"product": p_product, "strain": p_strain, "precursor": p_precursor})
+
+    cfg.production = []
+    if st.session_state.production_rows:
+        for i, row in enumerate(st.session_state.production_rows):
+            rcols = st.columns([5, 1])
+            rcols[0].write(f"{row['strain']} produces {row['product']} from {row['precursor']}")
+            add_production(cfg, row["product"], row["strain"], row["precursor"])
+            if rcols[1].button("Remove", key=f"rm_prod_{i}"):
+                st.session_state.production_rows.pop(i)
+                st.rerun()
+    else:
+        st.caption("No production pathways yet.")
+
+with tabs[3]:
     st.subheader("Mortality")
     _vector_editor("mortality", cfg.mortality, cfg.strain_names, "delta_edit")
     if include_mutation:
@@ -126,7 +190,7 @@ with tabs[2]:
     if not include_mutation and not include_translocation:
         st.info("Enable mutation and/or translocation in the sidebar to configure strain-strain transfer.")
 
-with tabs[3]:
+with tabs[4]:
     if n_metabolites > 0:
         st.subheader("Metabolite supply")
         _vector_editor("metabolite_supply", cfg.metabolite_supply, cfg.metabolite_names, "msup_edit")
@@ -138,8 +202,62 @@ with tabs[3]:
         st.subheader("Toxin decay")
         _vector_editor("toxin_decay", cfg.toxin_decay, cfg.toxin_names, "tdec_edit")
 
+    st.subheader("Discrete events (dosing / passage)")
+    st.caption(
+        "The supply/dilution rates above model a CONTINUOUS process (e.g. a true "
+        "chemostat feed). Use this instead for a DISCRETE one-time or repeated event — "
+        "a sugar addition, or a passage/dilution step (which also dilutes strain "
+        "populations, not just a metabolite/toxin — supply/dilution above can't do that)."
+    )
+    if "schedule_rows" not in st.session_state:
+        st.session_state.schedule_rows = []
+
+    ev_cols = st.columns([2, 2, 2, 2, 1])
+    ev_type = ev_cols[0].selectbox("Event type", ["Dosing (add/set one metabolite or toxin)", "Passage (dilute everything)"], key="ev_type")
+    ev_time = ev_cols[1].number_input("Time", value=0.0, key="ev_time")
+    if ev_type.startswith("Dosing"):
+        ev_target = ev_cols[2].selectbox("Target", cfg.metabolite_names + cfg.toxin_names, key="ev_target")
+        ev_kind = ev_cols[3].selectbox("Kind", ["add", "set"], key="ev_kind")
+        ev_amount = ev_cols[4].number_input("Amount", value=1.0, key="ev_amount")
+    else:
+        ev_target, ev_kind = None, None
+        ev_amount = ev_cols[2].number_input("Dilution factor (e.g. 0.1 = 10-fold)", value=0.1, min_value=0.0, max_value=1.0, key="ev_dilfactor")
+
+    if st.button("Add event"):
+        if ev_type.startswith("Dosing"):
+            st.session_state.schedule_rows.append({"type": "dosing", "time": ev_time, "target": ev_target, "kind": ev_kind, "amount": ev_amount})
+        else:
+            st.session_state.schedule_rows.append({"type": "passage", "time": ev_time, "dilution_factor": ev_amount})
+
+    cfg.schedule = []
+    if st.session_state.schedule_rows:
+        for i, row in enumerate(st.session_state.schedule_rows):
+            cols = st.columns([5, 1])
+            if row["type"] == "dosing":
+                cols[0].write(f"t={row['time']}: {row['kind']} {row['amount']} to {row['target']}")
+                add_dosing_event(cfg, row["time"], row["target"], row["kind"], row["amount"])
+            else:
+                cols[0].write(f"t={row['time']}: dilute EVERYTHING by factor {row['dilution_factor']}")
+                add_passage_event(cfg, row["time"], row["dilution_factor"])
+            if cols[1].button("Remove", key=f"rm_ev_{i}"):
+                st.session_state.schedule_rows.pop(i)
+                st.rerun()
+    else:
+        st.caption("No discrete events yet — continuous supply/dilution only.")
+
 n_free, _, _ = pack_free_params(cfg)
-st.caption(f"Current system: {len(n_free)} free parameters to fit.")
+st.caption(f"Current system: {len(n_free)} free parameters to fit (plus one per unmeasured initial condition, once data is uploaded below).")
+
+if st.button("Fill known strains from library"):
+    cfg, filled = apply_library(cfg, store_path=DEFAULT_LIBRARY_PATH)
+    st.session_state.cfg = cfg
+    if filled:
+        st.success(f"Filled {len(filled)} entries from previously-fit strains: " +
+                   ", ".join(f"{attr}{subject}" for attr, subject, _ in filled[:8]) +
+                   (" ..." if len(filled) > 8 else ""))
+    else:
+        st.info("No matching strain names found in the library yet — nothing to fill.")
+    st.rerun()
 
 # ---------------------------------------------------------------------------
 # 3. DATA — upload one or more CSVs and map columns to strains/metabolites/
@@ -184,6 +302,52 @@ if uploaded_files:
 
     st.success(f"Loaded {len(datasets)} dataset(s): " + ", ".join(ds.name for ds in datasets))
 
+    # ---------------------------------------------------------------------------
+    # 3b. STRUCTURE SEARCH — "should toxin/metabolic overlap/etc be in the
+    # model at all?" answered automatically, ranked by AICc, instead of you
+    # having to guess or build each variant by hand.
+    # ---------------------------------------------------------------------------
+    with st.expander("Not sure which processes to include? Search structures automatically"):
+        st.caption(
+            "Fits several structural variants (toxin present or not, one shared "
+            "metabolite vs. one per strain) against the data above and ranks them "
+            "by AICc — lower is better. This can take a while (each variant is a "
+            "full fit) and reuses the matrix settings above as the base, except "
+            "for the axes being searched."
+        )
+        search_toxin = st.checkbox("Search: toxin present vs. absent", value=(cfg.n_toxins > 0 or True))
+        search_overlap = st.checkbox("Search: shared vs. separate metabolite pool", value=True)
+        search_max_nfev = st.number_input("Max iterations per candidate fit", min_value=20, max_value=500, value=150)
+
+        if st.button("Run structure search"):
+            with st.spinner("Fitting each structural variant..."):
+                # rebuild from the raw uploaded bytes each time, since
+                # "separate metabolite" candidates need a different number
+                # of metabolite columns than "shared" ones
+                raw_bytes = [f.getvalue() for f in uploaded_files]
+
+                def _builder(candidate_cfg):
+                    import io
+                    built = []
+                    for name, content in zip([f.name for f in uploaded_files], raw_bytes):
+                        built.append(Dataset.from_csv(io.BytesIO(content), time_col, column_map, candidate_cfg, name=name))
+                    return built
+
+                search_results = compare_structures(
+                    _builder, n_strains=cfg.n_strains, strain_names=cfg.strain_names,
+                    include_toxin=(False, True) if search_toxin else (cfg.n_toxins > 0,),
+                    metabolic_overlap=("shared", "separate") if search_overlap else ("shared",),
+                    max_nfev=search_max_nfev,
+                )
+            st.text(summarize(search_results))
+            if search_results and not search_results[0].reliable:
+                st.warning(
+                    "The top-ranked structure has too few observed data points relative to its "
+                    "free parameters for AICc to be a reliable basis for comparison. This is common "
+                    "with a single small dataset — consider uploading more replicate files (fit "
+                    "jointly, above) before trusting the ranking."
+                )
+
 # ---------------------------------------------------------------------------
 # 4. FIT
 # ---------------------------------------------------------------------------
@@ -192,14 +356,15 @@ use_amortized = st.checkbox(
     "Use past fits to propose a starting guess (needs several prior fits of this same shape)",
     value=True,
 )
-save_to_store = st.checkbox("Save this fit for future guessing", value=True)
+save_to_store = st.checkbox("Save this fit for future guessing (same-shape systems)", value=True)
+save_to_library = st.checkbox("Save this fit's strain values to the library (for building larger systems later)", value=True)
 
 if st.button("Run fit", type="primary", disabled=(len(datasets) == 0)):
     n_datasets = len(datasets)
     with st.spinner(f"Fitting jointly across {n_datasets} dataset(s)..."):
         init_guess = None
         if use_amortized:
-            n_free, _, _ = pack_free_params(cfg)
+            n_free, _, _, _ = pack_free_params_with_y0(cfg, datasets)
             # the guesser is queried using the FIRST dataset's summary —
             # with replicate data the datasets should look similar enough
             # that this is a reasonable stand-in for "what this shape of
@@ -218,6 +383,9 @@ if st.button("Run fit", type="primary", disabled=(len(datasets) == 0)):
 
     if save_to_store:
         record_fit(result, DEFAULT_STORE_PATH)
+    if save_to_library:
+        n_written = record_strain_params(result, DEFAULT_LIBRARY_PATH)
+        st.caption(f"Saved {n_written} strain-keyed values to the library.")
 
 if "last_result" in st.session_state:
     result = st.session_state.last_result
@@ -228,9 +396,14 @@ if "last_result" in st.session_state:
         st.pyplot(fig)
 
     st.subheader("Fitted parameter values (shared across all datasets above)")
-    for attr in ["growth_rate", "growth_half_sat", "consumption", "toxin_kill_rate",
-                 "toxin_half_sat", "secretion", "mutation", "translocation"]:
+    for attr in ["r", "K", "c", "mutation", "translocation"]:
         spec = getattr(result.config, attr)
         if spec is not None:
             st.write(attr)
             st.dataframe(spec.values)
+    if result.config.production:
+        st.write("production")
+        st.dataframe(pd.DataFrame(result.config.production)[["product", "strain", "precursor", "rate", "half_sat"]])
+    if result.config.conjugative_transfer:
+        st.write("conjugative_transfer")
+        st.dataframe(pd.DataFrame(result.config.conjugative_transfer)[["product", "donor", "recipient", "rate"]])

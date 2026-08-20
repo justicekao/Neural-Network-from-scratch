@@ -45,10 +45,12 @@ KNOWN_VALUE = 0.3  # a stand-in for "parameters you already know from prior work
 
 # 1. Build a 2-strain, 1-metabolite, 1-toxin system with translocation on,
 #    then FIX everything except translocation — those are the unknowns
-#    we're actually trying to determine here.
+#    we're actually trying to determine here. r/K/c span BOTH the
+#    metabolite and the toxin (one combined substrate axis — see
+#    config.py and GUIDE.md for why): here that's 2 columns, metabolite
+#    first then toxin, so index 0 = metabolite, index 1 = toxin.
 cfg = default_config(n_strains=2, n_metabolites=1, n_toxins=1, include_translocation=True)
-for attr in ["growth_rate", "growth_half_sat", "consumption", "toxin_kill_rate",
-             "toxin_half_sat", "secretion", "mortality",
+for attr in ["r", "K", "c", "mortality",
              "metabolite_supply", "metabolite_dilution", "toxin_supply", "toxin_decay"]:
     spec = getattr(cfg, attr)
     for idx in np.ndindex(spec.shape):
@@ -62,8 +64,7 @@ cfg.translocation.set_fixed(0.0, 0, 1)
 #    real translocation rate (in real use, this step is replaced by
 #    loading your actual measurements instead)
 true_cfg = default_config(n_strains=2, n_metabolites=1, n_toxins=1, include_translocation=True)
-for attr in ["growth_rate", "growth_half_sat", "consumption", "toxin_kill_rate",
-             "toxin_half_sat", "secretion", "mortality",
+for attr in ["r", "K", "c", "mortality",
              "metabolite_supply", "metabolite_dilution", "toxin_supply", "toxin_decay"]:
     spec = getattr(true_cfg, attr)
     spec.values[np.isnan(spec.values)] = KNOWN_VALUE
